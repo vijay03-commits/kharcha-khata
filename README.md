@@ -1,3 +1,6 @@
+# If you want to use this app just open this URL and save app in your phone its totally free and offline and easy to maintain daily expesses
+## App link :- https://kharcha-khata.parmarvijay26032004.workers.dev
+
 # Kharcha Khata Offline
 
 An offline-first personal expense tracker based on the existing Kharcha Khata interface. Expense records are stored in the browser's IndexedDB database on the device that uses the app. There is no account login, backend API, cloud database, or automatic synchronization in this version.
