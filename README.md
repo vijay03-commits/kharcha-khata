@@ -1,5 +1,39 @@
-# If you want to use this app just open this URL and save app in your phone its totally free and offline and easy to maintain daily expesses
-## App link :- https://kharcha-khata.parmarvijay26032004.workers.dev
+# 💰 Kharcha Khata
+
+A free and simple app to track and manage your daily expenses.
+
+🔗 **App Link:** https://kharcha-khata.parmarvijay26032004.workers.dev
+
+## 📱 How to Install
+
+1. Open the app link in Google Chrome on your phone.
+2. Tap the three dots (⋮) in the top-right corner.
+3. Select **Install app** or **Add to Home screen**.
+4. Open the app from your home screen and start tracking expenses.
+
+## ✨ Features
+
+- ✅ Free to use
+- 💸 Track daily expenses
+- 📱 Easy to use on your phone
+- ⚡ Simple and clean interface
+- 📶 Offline support, depending on app configuration
+
+## 🛠️ Built For
+
+Simple and convenient daily expense tracking.
+
+## 🔒 Privacy
+
+Use the app responsibly and keep your expense data and backups safe.
+
+## ⭐ Support
+
+If you find this app useful, please **star ⭐ this repository** on GitHub!
+
+---
+
+**Made with ❤️ for easier expense tracking.**
 
 # Kharcha Khata Offline
 
