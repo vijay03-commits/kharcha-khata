@@ -1,4 +1,4 @@
-const CACHE_NAME = 'kharcha-khata-shell-v1';
+const CACHE_NAME = 'kharcha-khata-shell-v3';
 const APP_SHELL = ['/', '/index.html', '/manifest.webmanifest', '/favicon.svg', '/icons/icon-192.png', '/icons/icon-512.png', '/icons/icon-maskable-512.png'];
 self.addEventListener('install', (event) => {
   event.waitUntil((async () => {

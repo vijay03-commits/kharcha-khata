@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type FormEvent, type ReactNode, type RefObject } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode, type RefObject } from 'react';
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { Toaster } from '@/components/ui/toaster';
@@ -9,19 +9,36 @@ import {
   getListExpensesQueryKey,
   useCreateExpense,
   useDeleteExpense,
+  useUpdateExpense,
+  restoreDeletedExpense,
+  type ExpenseDeleteSnapshot,
   useDeleteExpensesBulk,
   useGetExpenseSummary,
   useListExpenses,
   ExpenseCategory as Categories,
   PaymentMethod as Payments,
   type Expense,
+  type BalanceTransaction,
+  type BalanceTransactionInput,
   type ExpenseCategory,
   type PaymentMethod,
   exportExpensesBackup,
   importExpensesBackup,
+  exportBalanceBackup,
+  importBalanceBackup,
+  exportFullBackup,
+  addExpense,
+  importFullBackup,
+  getBalanceTransactionsQueryKey,
+  getCurrentBalanceQueryKey,
+  useListBalanceTransactions,
+  useGetCurrentBalance,
+  useCreateBalanceTransaction,
+  useDeleteBalanceTransaction,
 } from './local-api';
 import {
   BarChart3,
+  ArrowLeftRight,
   Bike,
   Bolt,
   CalendarDays,
@@ -38,6 +55,9 @@ import {
   Layers3,
   Loader2,
   LockKeyhole,
+  Moon,
+  Sun,
+  Search,
   Menu,
   MoreHorizontal,
   Pencil,
@@ -87,6 +107,11 @@ type Summary = {
 
 const CHART_COLORS = ['#C95A4A', '#E7A52F', '#328A87', '#25284C', '#9479A9', '#6B8E77'];
 
+type RecurringRule = { id: string; name: string; amount: number; category: ExpenseCategory; payment: PaymentMethod; day: number; enabled: boolean; lastRunMonth?: string };
+type KharchaSettings = { monthlyBudget?: number; theme?: 'light' | 'dark' | 'system'; recurringRules?: RecurringRule[] };
+function readKharchaSettings(): KharchaSettings { try { const raw = localStorage.getItem('kharcha-khata-settings'); return raw ? JSON.parse(raw) as KharchaSettings : {}; } catch { return {}; } }
+function saveKharchaSettings(settings: KharchaSettings) { try { localStorage.setItem('kharcha-khata-settings', JSON.stringify(settings)); } catch { throw new Error('Settings could not be saved in this browser.'); } }
+
 function AppShell() {
   const today = useMemo(() => localDateKey(new Date()), []);
   const ranges = useMemo(() => ({
@@ -102,11 +127,18 @@ function AppShell() {
   const [customFrom, setCustomFrom] = useState(today);
   const [customTo, setCustomTo] = useState(today);
   const [pendingDelete, setPendingDelete] = useState<Expense | null>(null);
+  const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
+  const [undoSnapshot, setUndoSnapshot] = useState<ExpenseDeleteSnapshot | null>(null);
   const [pendingBulkDelete, setPendingBulkDelete] = useState<PeriodRange | null>(null);
   const [feedback, setFeedback] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
   const queryClient = useQueryClient();
   const amountRef = useRef<HTMLInputElement>(null);
   const backupInputRef = useRef<HTMLInputElement>(null);
+  const fullBackupInputRef = useRef<HTMLInputElement>(null);
+  const [settings, setSettings] = useState<KharchaSettings>(() => readKharchaSettings());
+  const [darkMode, setDarkMode] = useState(() => { const theme = readKharchaSettings().theme; try { return theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches) || localStorage.getItem('kharcha-khata-theme') === 'dark'; } catch { return theme === 'dark'; } });
+  useEffect(() => { document.documentElement.classList.toggle('dark', darkMode); try { localStorage.setItem('kharcha-khata-theme', darkMode ? 'dark' : 'light'); saveKharchaSettings({ ...readKharchaSettings(), theme: darkMode ? 'dark' : 'light' }); } catch { /* storage can be disabled */ } }, [darkMode]);
+  useEffect(() => { let cancelled = false; const runRecurring = async () => { const current = readKharchaSettings(); const rules = current.recurringRules ?? []; const todayKey = localDateKey(new Date()); const month = todayKey.slice(0, 7); const day = Number(todayKey.slice(8, 10)); let changed = false; for (const rule of rules) { if (cancelled || !rule.enabled || rule.day > day || rule.lastRunMonth === month) continue; try { await addExpense({ amount: rule.amount, category: rule.category, item: `${rule.name} (recurring)`, payment: rule.payment, spentAt: new Date(`${month}-${String(rule.day).padStart(2, '0')}T12:00:00`).toISOString() }); rule.lastRunMonth = month; changed = true; } catch { /* Retry next time the app opens. */ } } if (changed) { saveKharchaSettings({ ...current, recurringRules: rules }); await invalidateLedger(); showFeedback('success', 'Due recurring expenses were added to your ledger.'); } }; void runRecurring(); return () => { cancelled = true; }; }, []);
   const activeRange = periodFilter === 'custom'
     ? makePeriod('custom', customFrom <= customTo ? customFrom : customTo, customTo)
     : ranges[periodFilter];
@@ -125,6 +157,7 @@ function AppShell() {
   const listQuery = useListExpenses({ ...activeParams, limit: 500 });
   const createExpense = useCreateExpense();
   const deleteExpense = useDeleteExpense();
+  const updateExpense = useUpdateExpense();
   const deleteBulk = useDeleteExpensesBulk();
   const activeSummary = activeSummaryQuery.data as Summary | undefined;
   const expenses = useMemo(
@@ -141,6 +174,8 @@ function AppShell() {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: getListExpensesQueryKey() }),
       queryClient.invalidateQueries({ queryKey: getGetExpenseSummaryQueryKey() }),
+      queryClient.invalidateQueries({ queryKey: getBalanceTransactionsQueryKey() }),
+      queryClient.invalidateQueries({ queryKey: getCurrentBalanceQueryKey() }),
     ]);
   };
   const handleCreate = (input: { amount: number; category: ExpenseCategory; item?: string; payment: PaymentMethod; spentAt?: string }) => {
@@ -156,13 +191,26 @@ function AppShell() {
   const handleDelete = () => {
     if (!pendingDelete) return;
     deleteExpense.mutate({ id: pendingDelete.id }, {
-      onSuccess: async () => {
+      onSuccess: async (snapshot) => {
         setPendingDelete(null);
+        setUndoSnapshot(snapshot);
         await invalidateLedger();
-        showFeedback('success', 'Expense removed from your ledger.');
+        showFeedback('success', 'Expense removed. You can undo this action.');
       },
       onError: () => showFeedback('error', 'That expense could not be removed.'),
     });
+  };
+  const handleUpdateExpense = (input: { amount: number; category: ExpenseCategory; item?: string; payment: PaymentMethod; spentAt?: string }) => {
+    if (!editingExpense) return;
+    updateExpense.mutate({ id: editingExpense.id, data: input }, {
+      onSuccess: async () => { setEditingExpense(null); await invalidateLedger(); showFeedback('success', 'Expense and its balance deduction were updated together.'); },
+      onError: (error) => showFeedback('error', error instanceof Error ? error.message : 'Could not update this expense.'),
+    });
+  };
+  const handleUndoDelete = async () => {
+    if (!undoSnapshot) return;
+    try { await restoreDeletedExpense(undoSnapshot); setUndoSnapshot(null); await invalidateLedger(); showFeedback('success', 'Expense restored and balance recalculated.'); }
+    catch { showFeedback('error', 'Could not undo deletion.'); }
   };
   const handleBulkDelete = () => {
     if (!pendingBulkDelete) return;
@@ -183,6 +231,17 @@ function AppShell() {
     } catch {
       showFeedback('error', 'Could not export the backup.');
     }
+  };
+  const handleFullBackupExport = async () => {
+    try { const blob = await exportFullBackup(); triggerDownload(blob, `kharcha-khata-full-backup-${localDateKey(new Date())}.json`); showFeedback('success', 'Full backup exported: expenses, balance transactions, and saved settings.'); }
+    catch { showFeedback('error', 'Could not export the full backup.'); }
+  };
+  const handleFullBackupImport = async (file?: File) => {
+    if (!file) return;
+    if (!window.confirm('A full restore replaces all expenses, Credits & Balance transactions, and saved settings on this device. Export a backup of the current data first if you may need it. Continue?')) { if (fullBackupInputRef.current) fullBackupInputRef.current.value = ''; return; }
+    try { const raw = JSON.parse(await file.text()); const result = await importFullBackup(raw); setSettings(readKharchaSettings()); const restoredTheme = readKharchaSettings().theme; if (restoredTheme) setDarkMode(restoredTheme === 'dark' || (restoredTheme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)); await invalidateLedger(); await Promise.all([queryClient.refetchQueries({ queryKey: getListExpensesQueryKey() }), queryClient.refetchQueries({ queryKey: getGetExpenseSummaryQueryKey() }), queryClient.refetchQueries({ queryKey: getBalanceTransactionsQueryKey() }), queryClient.refetchQueries({ queryKey: getCurrentBalanceQueryKey() })]); showFeedback('success', `Full restore complete: ${result.expenses} expenses and ${result.balanceTransactions} balance transactions.`); }
+    catch (error) { showFeedback('error', error instanceof Error ? error.message : 'Could not restore the full backup.'); }
+    finally { if (fullBackupInputRef.current) fullBackupInputRef.current.value = ''; }
   };
   const handleImportBackup = async (file?: File) => {
     if (!file) return;
@@ -222,8 +281,10 @@ function AppShell() {
     customTo,
     setCustomTo,
     setPendingDelete,
+    setEditingExpense,
     setPendingBulkDelete,
     focusAmount,
+    duplicateExpense: (expense: Expense) => { handleCreate({ amount: expense.amount, category: expense.category, item: expense.item ?? '', payment: expense.payment, spentAt: new Date().toISOString() }); },
     downloadPdf: () => {
       const report = buildReport(activeRange, activeSummary, expenses, categoryFilter, paymentFilter);
       triggerDownload(buildPdfBlob(report.title, report.lines), report.filename);
@@ -231,6 +292,8 @@ function AppShell() {
     },
     exportBackup: handleExportBackup,
     restoreBackup: () => backupInputRef.current?.click(),
+    exportFullBackup: handleFullBackupExport,
+    restoreFullBackup: () => fullBackupInputRef.current?.click(),
     sharePdf: async () => {
       const report = buildReport(activeRange, activeSummary, expenses, categoryFilter, paymentFilter);
       const blob = buildPdfBlob(report.title, report.lines);
@@ -259,16 +322,20 @@ function AppShell() {
             <div className="flex items-center gap-2">
               <button type="button" onClick={() => showFeedback('success', 'Your expenses are stored on this device in IndexedDB. Export a JSON backup regularly to protect against device loss.')} className="hidden h-10 w-10 place-items-center rounded-full border border-border text-muted-foreground transition-colors hover:bg-card hover:text-foreground sm:grid" aria-label="Storage information"><LockKeyhole className="h-[17px] w-[17px]" /></button>
               <button type="button" onClick={() => showFeedback('success', 'Choose Reports for filters, charts, and PDF export.')} className="grid h-10 w-10 place-items-center rounded-full border border-border text-muted-foreground transition-colors hover:bg-card hover:text-foreground" aria-label="Help"><CircleHelp className="h-[18px] w-[18px]" /></button>
-              <input ref={backupInputRef} type="file" accept="application/json,.json" className="hidden" onChange={(event) => void handleImportBackup(event.currentTarget.files?.[0])} aria-label="Choose a Kharcha Khata JSON backup" />
+              <input ref={backupInputRef} type="file" accept="application/json,.json" className="hidden" onChange={(event) => void handleImportBackup(event.currentTarget.files?.[0])} aria-label="Choose an expense JSON backup" />
+              <input ref={fullBackupInputRef} type="file" accept="application/json,.json" className="hidden" onChange={(event) => void handleFullBackupImport(event.currentTarget.files?.[0])} aria-label="Choose a full Kharcha Khata backup" />
+              <button type="button" onClick={() => setDarkMode((value) => !value)} className="grid h-10 w-10 place-items-center rounded-full border border-border text-muted-foreground transition-colors hover:bg-card hover:text-foreground" aria-label={darkMode ? "Switch to light mode" : "Switch to dark mode"} title={darkMode ? "Light mode" : "Dark mode"}>{darkMode ? <Sun className="h-[17px] w-[17px]" /> : <Moon className="h-[17px] w-[17px]" />}</button>
               <button type="button" onClick={focusAmount} className="lux-button group flex items-center gap-2 rounded-full bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground"><Plus className="h-4 w-4 transition-transform group-hover:rotate-90" /><span className="hidden sm:inline">Add expense</span><span className="sm:hidden">Add</span></button>
             </div>
           </header>
-          {feedback && <div className={`animate-pop mb-5 mt-5 flex items-center gap-2 rounded-xl border px-4 py-3 text-sm ${feedback.kind === 'success' ? 'border-[hsl(var(--chart-3)/.3)] bg-[hsl(var(--chart-3)/.1)] text-[hsl(var(--chart-3))]' : 'border-destructive/30 bg-destructive/10 text-destructive'}`} role="status"><Check className="h-4 w-4" />{feedback.text}<button type="button" className="ml-auto" aria-label="Dismiss message" onClick={() => setFeedback(null)}><X className="h-4 w-4" /></button></div>}
+          {feedback && <div className={`animate-pop mb-5 mt-5 flex items-center gap-2 rounded-xl border px-4 py-3 text-sm ${feedback.kind === 'success' ? 'border-[hsl(var(--chart-3)/.3)] bg-[hsl(var(--chart-3)/.1)] text-[hsl(var(--chart-3))]' : 'border-destructive/30 bg-destructive/10 text-destructive'}`} role="status"><Check className="h-4 w-4" />{feedback.text}{undoSnapshot && feedback.kind === 'success' && <button type="button" onClick={() => void handleUndoDelete()} className="ml-auto rounded-lg border border-current/30 px-3 py-1.5 font-semibold">Undo</button>}<button type="button" className="ml-auto" aria-label="Dismiss message" onClick={() => setFeedback(null)}><X className="h-4 w-4" /></button></div>}
           <div className="page-transition pt-7">
             <Switch>
               <Route path="/"><DashboardPage {...shared} todaySummary={todaySummaryQuery.data} weekSummary={weekSummaryQuery.data} monthSummary={monthSummaryQuery.data} yearSummary={yearSummaryQuery.data} /></Route>
               <Route path="/ledger"><LedgerPage {...shared} onRetry={() => listQuery.refetch()} /></Route>
               <Route path="/reports"><ReportsPage {...shared} /></Route>
+              <Route path="/balance"><BalancePage /></Route>
+              <Route path="/settings"><SettingsPage settings={settings} onSave={(next) => { saveKharchaSettings(next); setSettings(next); showFeedback('success', 'Settings saved on this device.'); }} /></Route>
               <Route path="/add"><AddExpensePage onSubmit={handleCreate} isPending={createExpense.isPending} inputRef={amountRef} /></Route>
               <Route component={NotFound} />
             </Switch>
@@ -277,6 +344,7 @@ function AppShell() {
       </div>
       <MobileNav location={location} navigate={navigate} />
       {pendingDelete && <DeleteDialog expense={pendingDelete} isPending={deleteExpense.isPending} onCancel={() => setPendingDelete(null)} onConfirm={handleDelete} />}
+      {editingExpense && <EditExpenseDialog expense={editingExpense} isPending={updateExpense.isPending} onCancel={() => setEditingExpense(null)} onSave={handleUpdateExpense} />}
       {pendingBulkDelete && <BulkDeleteDialog range={pendingBulkDelete} isPending={deleteBulk.isPending} onCancel={() => setPendingBulkDelete(null)} onConfirm={handleBulkDelete} />}
     </div>
   );
@@ -301,13 +369,297 @@ type SharedProps = {
   customTo: string;
   setCustomTo: (value: string) => void;
   setPendingDelete: (expense: Expense) => void;
+  setEditingExpense: (expense: Expense) => void;
   setPendingBulkDelete: (range: PeriodRange) => void;
   focusAmount: () => void;
+  duplicateExpense: (expense: Expense) => void;
   downloadPdf: () => void;
   sharePdf: () => Promise<void>;
   exportBackup: () => Promise<void>;
   restoreBackup: () => void;
+  exportFullBackup: () => Promise<void>;
+  restoreFullBackup: () => void;
 };
+
+function BalancePage() {
+  const queryClient = useQueryClient();
+  const transactionsQuery = useListBalanceTransactions();
+  const balanceQuery = useGetCurrentBalance();
+  const createTransaction = useCreateBalanceTransaction();
+  const deleteTransaction = useDeleteBalanceTransaction();
+  const balanceBackupInputRef = useRef<HTMLInputElement>(null);
+
+  const [amount, setAmount] = useState('');
+  const [description, setDescription] = useState('');
+  const [person, setPerson] = useState('');
+  const [payment, setPayment] = useState<PaymentMethod>('Cash');
+  const [createdAt, setCreatedAt] = useState(localDateKey(new Date()));
+  const [error, setError] = useState('');
+
+  const transactions = transactionsQuery.data ?? [];
+  const balance = balanceQuery.data ?? 0;
+
+  const formatMoney = (value: number) =>
+    `₹${formatAmount(value)}`;
+
+  const exportBalance = async () => {
+    try {
+      const blob = await exportBalanceBackup();
+      triggerDownload(blob, `kharcha-khata-balance-backup-${localDateKey(new Date())}.json`);
+      setError('');
+    } catch {
+      setError('Could not export the balance backup.');
+    }
+  };
+
+  const importBalance = async (file?: File) => {
+    if (!file) return;
+    if (!window.confirm('Restoring a balance backup replaces only Credits & Balance transactions. Existing expenses will not be changed. Continue?')) {
+      if (balanceBackupInputRef.current) balanceBackupInputRef.current.value = '';
+      return;
+    }
+    try {
+      const raw = JSON.parse(await file.text());
+      const count = await importBalanceBackup(raw);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: getBalanceTransactionsQueryKey() }),
+        queryClient.invalidateQueries({ queryKey: getCurrentBalanceQueryKey() }),
+      ]);
+      setError('');
+      window.alert(`Restored ${count} balance transaction${count === 1 ? '' : 's'}. Expenses were not changed.`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not restore the balance backup.');
+    } finally {
+      if (balanceBackupInputRef.current) balanceBackupInputRef.current.value = '';
+    }
+  };
+
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setError('');
+
+    const value = Number(amount);
+    if (!Number.isFinite(value) || value <= 0) {
+      setError('Enter an amount greater than zero.');
+      return;
+    }
+    if (!description.trim()) {
+      setError('Enter a description.');
+      return;
+    }
+
+    const input: BalanceTransactionInput = {
+      type: 'credit',
+      amount: value,
+      description: description.trim(),
+      person: person.trim() || undefined,
+      payment,
+      createdAt: new Date(`${createdAt}T12:00:00`).toISOString(),
+    };
+
+    createTransaction.mutate(
+      { data: input },
+      {
+        onSuccess: async () => {
+          await Promise.all([
+            queryClient.invalidateQueries({ queryKey: getBalanceTransactionsQueryKey() }),
+            queryClient.invalidateQueries({ queryKey: getCurrentBalanceQueryKey() }),
+          ]);
+          setAmount('');
+          setDescription('');
+          setPerson('');
+          setError('');
+        },
+        onError: () => setError('Could not save this transaction. Try again.'),
+      }
+    );
+  };
+
+  const removeTransaction = (transaction: BalanceTransaction) => {
+    if (!window.confirm(`Delete "${transaction.description}" (${formatMoney(transaction.amount)})?`)) return;
+
+    deleteTransaction.mutate(
+      { id: transaction.id },
+      {
+        onSuccess: async () => {
+          await Promise.all([
+            queryClient.invalidateQueries({ queryKey: getBalanceTransactionsQueryKey() }),
+            queryClient.invalidateQueries({ queryKey: getCurrentBalanceQueryKey() }),
+          ]);
+        },
+        onError: () => setError('Could not delete this transaction.'),
+      }
+    );
+  };
+
+  return (
+    <div className="space-y-7">
+      <PageIntro
+        eyebrow="Money in and out"
+        title="Credits & Balance"
+        description="Record money received here. New expenses are deducted from your balance automatically."
+        action={
+          <div className="flex flex-wrap gap-2">
+            <input
+              ref={balanceBackupInputRef}
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              aria-label="Choose a Credits and Balance backup"
+              onChange={(event) => void importBalance(event.currentTarget.files?.[0])}
+            />
+            <button type="button" onClick={() => balanceBackupInputRef.current?.click()} className="lux-button flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-3 text-xs font-bold">
+              <Upload className="h-4 w-4" /> Restore balance
+            </button>
+            <button type="button" onClick={() => void exportBalance()} className="lux-button flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-3 text-xs font-bold">
+              <Download className="h-4 w-4" /> Backup balance
+            </button>
+          </div>
+        }
+      />
+
+      <section className="rounded-[1.6rem] bg-primary p-6 text-primary-foreground sm:p-8">
+        <p className="font-mono text-xs uppercase tracking-[.2em] text-primary-foreground/65">
+          Remaining balance
+        </p>
+        <h2 className="mt-4 font-serif text-5xl tracking-tight">
+          {formatMoney(balance)}
+        </h2>
+        <p className="mt-3 text-sm text-primary-foreground/65">
+          Calculated from all credits minus all debits.
+        </p>
+      </section>
+
+      <section className="lux-card rounded-[1.6rem] p-5 sm:p-7">
+        <SectionHeading
+          eyebrow="New entry"
+          title="Record money received"
+          icon={<WalletCards className="h-5 w-5 text-accent" />}
+        />
+
+        <form onSubmit={submit} className="mt-6 space-y-4">
+          <label className="block text-sm font-medium">
+            Amount (₹)
+            <input
+              type="number"
+              min="0.01"
+              step="0.01"
+              required
+              value={amount}
+              onChange={(event) => setAmount(event.target.value)}
+              className="mt-2 w-full rounded-xl border border-border bg-background px-4 py-3"
+              placeholder="e.g. 1000"
+            />
+          </label>
+
+          <label className="block text-sm font-medium">
+            Description
+            <input
+              required
+              maxLength={500}
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              className="mt-2 w-full rounded-xl border border-border bg-background px-4 py-3"
+              placeholder="e.g. Monthly allowance or groceries"
+            />
+          </label>
+
+          <label className="block text-sm font-medium">
+            Person or source (optional)
+            <input
+              maxLength={200}
+              value={person}
+              onChange={(event) => setPerson(event.target.value)}
+              className="mt-2 w-full rounded-xl border border-border bg-background px-4 py-3"
+              placeholder="e.g. Person A"
+            />
+          </label>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <label className="block text-sm font-medium">
+              Payment method
+              <select
+                value={payment}
+                onChange={(event) => setPayment(event.target.value as PaymentMethod)}
+                className="mt-2 w-full rounded-xl border border-border bg-background px-4 py-3"
+              >
+                {Object.values(Payments).map((method) => (
+                  <option key={method} value={method}>{method}</option>
+                ))}
+              </select>
+            </label>
+
+            <label className="block text-sm font-medium">
+              Date
+              <input
+                type="date"
+                required
+                value={createdAt}
+                onChange={(event) => setCreatedAt(event.target.value)}
+                className="mt-2 w-full rounded-xl border border-border bg-background px-4 py-3"
+              />
+            </label>
+          </div>
+
+          {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
+
+          <button
+            type="submit"
+            disabled={createTransaction.isPending}
+            className="lux-button w-full rounded-xl bg-primary px-4 py-3 font-semibold text-primary-foreground disabled:opacity-50"
+          >
+            {createTransaction.isPending ? 'Saving...' : 'Save transaction'}
+          </button>
+        </form>
+      </section>
+
+      <section className="lux-card rounded-[1.6rem] p-5 sm:p-7">
+        <SectionHeading
+          eyebrow="Your records"
+          title="Transaction history"
+          icon={<Receipt className="h-5 w-5 text-accent" />}
+        />
+
+        {transactionsQuery.isLoading ? (
+          <p className="py-6 text-sm text-muted-foreground">Loading transactions...</p>
+        ) : transactionsQuery.isError ? (
+          <p className="py-6 text-sm text-destructive">Could not load transactions. Refresh the page and try again.</p>
+        ) : transactions.length === 0 ? (
+          <p className="py-8 text-sm text-muted-foreground">No transactions yet. Add your first credit above.</p>
+        ) : (
+          <div className="mt-4 divide-y divide-border">
+            {transactions.map((transaction) => (
+              <div key={transaction.id} className="flex items-start gap-3 py-4">
+                <div className={`grid h-10 w-10 shrink-0 place-items-center rounded-full ${transaction.type === 'credit' ? 'bg-[hsl(var(--chart-3)/.12)] text-[hsl(var(--chart-3))]' : 'bg-destructive/10 text-destructive'}`}>
+                  {transaction.type === 'credit' ? '+' : '−'}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="break-words font-semibold">{transaction.description}</p>
+                  {transaction.person && <p className="mt-1 text-xs text-muted-foreground">{transaction.person}</p>}
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {formatDateTime(transaction.createdAt)} · {transaction.payment}
+                  </p>
+                </div>
+                <div className="text-right">
+                  <p className={`whitespace-nowrap font-semibold ${transaction.type === 'credit' ? 'text-[hsl(var(--chart-3))]' : 'text-destructive'}`}>
+                    {transaction.type === 'credit' ? '+' : '−'}{formatMoney(transaction.amount)}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => removeTransaction(transaction)}
+                    className="mt-2 text-xs text-muted-foreground underline hover:text-destructive"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
 
 function DashboardPage({ today, ranges, activeSummary, expenses, focusAmount, setPeriodFilter, todaySummary, weekSummary, monthSummary, yearSummary }: SharedProps & { todaySummary?: { total: number; count: number }; weekSummary?: { total: number; count: number }; monthSummary?: { total: number; count: number }; yearSummary?: { total: number; count: number } }) {
   const summary = todaySummary;
@@ -326,6 +678,7 @@ function DashboardPage({ today, ranges, activeSummary, expenses, focusAmount, se
       <PeriodCard title="This month" summary={monthSummary} active={false} onClick={() => setPeriodFilter('month')} />
       <PeriodCard title="This year" summary={yearSummary} active={false} onClick={() => setPeriodFilter('year')} />
     </section>
+    <section className="lux-card rounded-[1.6rem] p-5 sm:p-7"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="font-mono text-[10px] uppercase tracking-[.18em] text-muted-foreground">Monthly plan</p><h2 className="mt-2 font-serif text-3xl">Spending budget</h2><p className="mt-2 text-sm text-muted-foreground">Set a monthly limit in Settings and track how much remains.</p></div><a href="/settings" className="rounded-xl border border-border px-4 py-2.5 text-sm font-semibold">Set budget</a></div>{(() => { const budget = readKharchaSettings().monthlyBudget ?? 0; const spent = monthSummary?.total ?? 0; const progress = budget > 0 ? Math.min(100, spent / budget * 100) : 0; return <><div className="mt-5 flex items-end justify-between gap-3"><div><p className="text-xs text-muted-foreground">Spent this month</p><p className="mt-1 font-serif text-2xl">₹{formatAmount(spent)}</p></div><div className="text-right"><p className="text-xs text-muted-foreground">{budget > 0 ? 'Budget' : 'No budget set'}</p><p className="mt-1 font-serif text-xl">{budget > 0 ? `₹${formatAmount(budget)}` : '—'}</p></div></div><div className="mt-4 h-3 overflow-hidden rounded-full bg-muted"><div className={`h-full rounded-full transition-all ${progress >= 100 ? 'bg-destructive' : progress >= 80 ? 'bg-[hsl(38_92%_50%)]' : 'bg-[hsl(150_45%_38%)]'}`} style={{ width: `${progress}%` }} /></div><p className={`mt-2 text-sm ${budget > 0 && spent > budget ? 'font-semibold text-destructive' : 'text-muted-foreground'}`}>{budget <= 0 ? 'Choose a monthly limit to enable budget warnings.' : spent > budget ? `Over budget by ₹${formatAmount(spent - budget)}.` : `₹${formatAmount(budget - spent)} remaining · ${Math.round(progress)}% used`}</p></>; })()}</section>
     <section className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(310px,.55fr)]">
       <div className="lux-card rounded-[1.6rem] p-5 sm:p-7"><SectionHeading eyebrow="At a glance" title="Recent spending" icon={<Receipt className="h-5 w-5 text-accent" />} action="View ledger" href="/ledger" /><ExpenseList expenses={expenses.slice(0, 5)} isLoading={false} isError={false} onRetry={() => undefined} onDelete={() => undefined} compact /></div>
       <div className="lux-card rounded-[1.6rem] p-5 sm:p-7"><SectionHeading eyebrow="A little perspective" title="Open your reports" icon={<BarChart3 className="h-5 w-5 text-accent" />} /><p className="mt-5 text-sm leading-relaxed text-muted-foreground">See your habits from four angles with interactive charts, filters, and a shareable PDF.</p><a href="/reports" className="lux-button mt-7 flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-3 text-sm font-bold text-primary-foreground">Explore reports <TrendingUp className="h-4 w-4" /></a><div className="mt-6 grid grid-cols-2 gap-2">{[['Entries', activeSummary?.count ?? 0], ['Tracked', `₹${formatAmount(activeSummary?.total ?? 0)}`]].map(([label, value]) => <div key={label} className="rounded-xl bg-muted/65 p-3"><p className="font-mono text-[10px] uppercase tracking-[.15em] text-muted-foreground">{label}</p><p className="mt-2 font-serif text-xl">{value}</p></div>)}</div></div>
@@ -334,13 +687,21 @@ function DashboardPage({ today, ranges, activeSummary, expenses, focusAmount, se
 }
 
 function LedgerPage(props: SharedProps & { onRetry: () => void }) {
-  const { activeRange, activeSummary, expenses, listQuery, setPendingDelete, setPendingBulkDelete, ranges } = props;
-  return <div className="space-y-6"><PageIntro eyebrow="Your record" title="Ledger" description="Every note, kept in one calm place." action={<button type="button" onClick={props.focusAmount} className="lux-button flex items-center gap-2 rounded-xl bg-secondary px-4 py-3 text-sm font-bold text-secondary-foreground"><Plus className="h-4 w-4" /> Add expense</button>} /><FilterPanel {...props} /><div className="lux-card rounded-[1.6rem] p-5 sm:p-7"><div className="flex flex-wrap items-end justify-between gap-3 border-b border-border pb-5"><div><p className="font-mono text-[10px] uppercase tracking-[.2em] text-muted-foreground">Filtered ledger</p><h2 className="mt-2 font-serif text-3xl">Recent spending</h2></div><span className="rounded-full bg-muted px-3 py-1.5 font-mono text-[11px] text-muted-foreground">{activeSummary?.count ?? expenses.length} total</span></div><ExpenseList expenses={expenses} isLoading={listQuery.isLoading} isError={listQuery.isError} onRetry={props.onRetry} onDelete={setPendingDelete} /></div><BulkDeletePanel period={props.periodFilter} ranges={ranges} onDelete={setPendingBulkDelete} /></div>;
+  const { activeSummary, expenses, listQuery, setPendingDelete, setEditingExpense, setPendingBulkDelete, ranges } = props;
+  const [search, setSearch] = useState('');
+  const filteredExpenses = expenses.filter((expense) => `${expense.item ?? ''} ${expense.category} ${expense.payment} ${expense.amount}`.toLowerCase().includes(search.trim().toLowerCase()));
+  return <div className="space-y-6"><PageIntro eyebrow="Your record" title="Ledger" description="Every note, kept in one calm place." action={<button type="button" onClick={props.focusAmount} className="lux-button flex items-center gap-2 rounded-xl bg-secondary px-4 py-3 text-sm font-bold text-secondary-foreground"><Plus className="h-4 w-4" /> Add expense</button>} /><FilterPanel {...props} /><div className="lux-card rounded-[1.6rem] p-5 sm:p-7"><div className="flex flex-wrap items-end justify-between gap-3 border-b border-border pb-5"><div><p className="font-mono text-[10px] uppercase tracking-[.2em] text-muted-foreground">Filtered ledger</p><h2 className="mt-2 font-serif text-3xl">Recent spending</h2></div><span className="rounded-full bg-muted px-3 py-1.5 font-mono text-[11px] text-muted-foreground">{filteredExpenses.length} shown · ₹{formatAmount(activeSummary?.total ?? 0)} total</span></div><label className="relative my-4 block"><span className="sr-only">Search expenses</span><Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search notes, category, payment, amount…" className="input-notebook h-11 w-full rounded-xl pl-10 pr-3 text-sm" /></label><ExpenseList expenses={filteredExpenses} isLoading={listQuery.isLoading} isError={listQuery.isError} onRetry={props.onRetry} onDelete={setPendingDelete} onEdit={setEditingExpense} onDuplicate={props.duplicateExpense} /></div><BulkDeletePanel period={props.periodFilter} ranges={ranges} onDelete={setPendingBulkDelete} /></div>;
 }
 
 function ReportsPage(props: SharedProps) {
   const { activeRange, activeSummary, expenses, activeSummaryQuery } = props;
-  return <div className="space-y-6"><PageIntro eyebrow="Your patterns" title="Reports" description="A clearer picture of where your money goes." action={<div className="flex flex-wrap gap-2"><button type="button" onClick={props.restoreBackup} className="lux-button flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-3 text-xs font-bold"><Upload className="h-4 w-4" /> Restore</button><button type="button" onClick={props.exportBackup} className="lux-button flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-3 text-xs font-bold"><Download className="h-4 w-4" /> Backup</button><button type="button" onClick={props.sharePdf} className="lux-button flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-3 text-xs font-bold"><Share2 className="h-4 w-4" /> Share</button><button type="button" onClick={props.downloadPdf} className="lux-button flex items-center gap-2 rounded-xl bg-secondary px-3 py-3 text-xs font-bold text-secondary-foreground"><Download className="h-4 w-4" /> PDF</button></div>} /><FilterPanel {...props} /><div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Kpi label="Total tracked" value={`₹${formatAmount(activeSummary?.total ?? 0)}`} icon={<IndianRupee className="h-4 w-4" />} /><Kpi label="Entries" value={String(activeSummary?.count ?? 0)} icon={<Receipt className="h-4 w-4" />} /><Kpi label="Top category" value={activeSummary?.byCategory?.[0] ? categoryLabel(activeSummary.byCategory[0].category) : '—'} icon={<Layers3 className="h-4 w-4" />} /><Kpi label="Top payment" value={activeSummary?.byPayment?.[0]?.payment ?? '—'} icon={<WalletCards className="h-4 w-4" />} /></div><ReportCharts summary={activeSummary} expenses={expenses} isLoading={activeSummaryQuery.isLoading} rangeLabel={activeRange.label} /></div>;
+  return <div className="space-y-6"><PageIntro eyebrow="Your patterns" title="Reports" description="A clearer picture of where your money goes." action={<div className="flex flex-wrap gap-2"><button type="button" onClick={props.restoreBackup} className="lux-button flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-3 text-xs font-bold"><Upload className="h-4 w-4" /> Restore</button><button type="button" onClick={props.exportBackup} className="lux-button flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-3 text-xs font-bold"><Download className="h-4 w-4" /> Backup</button><button type="button" onClick={props.restoreFullBackup} className="lux-button flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-3 text-xs font-bold"><RotateCcw className="h-4 w-4" /> Full restore</button><button type="button" onClick={props.exportFullBackup} className="lux-button flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-3 text-xs font-bold"><Download className="h-4 w-4" /> Full backup</button><button type="button" onClick={() => exportExpensesCsv(expenses)} className="lux-button flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-3 text-xs font-bold"><FileText className="h-4 w-4" /> CSV</button><button type="button" onClick={props.sharePdf} className="lux-button flex items-center gap-2 rounded-xl border border-border bg-card px-3 py-3 text-xs font-bold"><Share2 className="h-4 w-4" /> Share</button><button type="button" onClick={props.downloadPdf} className="lux-button flex items-center gap-2 rounded-xl bg-secondary px-3 py-3 text-xs font-bold text-secondary-foreground"><Download className="h-4 w-4" /> PDF</button></div>} /><FilterPanel {...props} /><div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Kpi label="Total tracked" value={`₹${formatAmount(activeSummary?.total ?? 0)}`} icon={<IndianRupee className="h-4 w-4" />} /><Kpi label="Entries" value={String(activeSummary?.count ?? 0)} icon={<Receipt className="h-4 w-4" />} /><Kpi label="Top category" value={activeSummary?.byCategory?.[0] ? categoryLabel(activeSummary.byCategory[0].category) : '—'} icon={<Layers3 className="h-4 w-4" />} /><Kpi label="Top payment" value={activeSummary?.byPayment?.[0]?.payment ?? '—'} icon={<WalletCards className="h-4 w-4" />} /></div><ReportCharts summary={activeSummary} expenses={expenses} isLoading={activeSummaryQuery.isLoading} rangeLabel={activeRange.label} /></div>;
+}
+
+function SettingsPage({ settings, onSave }: { settings: KharchaSettings; onSave: (settings: KharchaSettings) => void }) {
+  const [budget, setBudget] = useState(settings.monthlyBudget ? String(settings.monthlyBudget) : '');
+  const [name, setName] = useState(''); const [amount, setAmount] = useState(''); const [category, setCategory] = useState<ExpenseCategory>(Categories.Bills); const [payment, setPayment] = useState<PaymentMethod>(Payments.UPI); const [day, setDay] = useState('1'); const [error, setError] = useState(''); const rules = settings.recurringRules ?? [];
+  return <div className="mx-auto max-w-4xl space-y-6"><PageIntro eyebrow="Preferences" title="Settings" description="Set your monthly budget and manage recurring expenses stored on this device."/><section className="lux-card rounded-2xl p-5 sm:p-7"><SectionHeading eyebrow="Monthly limit" title="Spending budget" icon={<IndianRupee className="h-5 w-5 text-accent"/>}/><form onSubmit={(e) => { e.preventDefault(); const value = Number(budget); if (budget && (!Number.isFinite(value) || value <= 0)) { setError('Budget must be greater than zero.'); return; } onSave({ ...settings, monthlyBudget: value || 0 }); setError(''); }} className="mt-5 flex flex-col gap-3 sm:flex-row"><label className="flex-1 text-sm font-medium">Monthly budget (₹)<input type="number" min="0" step="0.01" value={budget} onChange={(e) => setBudget(e.target.value)} placeholder="e.g. 15000" className="input-notebook mt-1.5 h-12 w-full rounded-xl px-3"/></label><button className="self-end rounded-xl bg-primary px-5 py-3 font-semibold text-primary-foreground">Save budget</button></form></section><section className="lux-card rounded-2xl p-5 sm:p-7"><SectionHeading eyebrow="Automation" title="Recurring expenses" icon={<CalendarRange className="h-5 w-5 text-accent"/>}/><p className="mt-3 text-sm text-muted-foreground">Due recurring expenses are added automatically when you open the app on or after the due day. Each rule runs once per month.</p><form onSubmit={(e) => { e.preventDefault(); const value = Number(amount); if (!name.trim() || !Number.isFinite(value) || value <= 0) { setError('Enter a name and a positive amount.'); return; } const rule: RecurringRule = { id: crypto.randomUUID(), name: name.trim(), amount: value, category, payment, day: Math.min(28, Math.max(1, Number(day) || 1)), enabled: true }; onSave({ ...settings, recurringRules: [...rules, rule] }); setName(''); setAmount(''); setError(''); }} className="mt-5 grid gap-3 sm:grid-cols-2"><label className="text-sm font-medium">Name<input required value={name} onChange={(e) => setName(e.target.value)} placeholder="Rent, subscription…" className="input-notebook mt-1.5 h-11 w-full rounded-xl px-3"/></label><label className="text-sm font-medium">Amount (₹)<input required type="number" min="0.01" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} className="input-notebook mt-1.5 h-11 w-full rounded-xl px-3"/></label><label className="text-sm font-medium">Category<select value={category} onChange={(e) => setCategory(e.target.value as ExpenseCategory)} className="input-notebook mt-1.5 h-11 w-full rounded-xl px-3">{categoryOptions.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}</select></label><label className="text-sm font-medium">Payment method<select value={payment} onChange={(e) => setPayment(e.target.value as PaymentMethod)} className="input-notebook mt-1.5 h-11 w-full rounded-xl px-3">{Object.values(Payments).map((p) => <option key={p} value={p}>{p}</option>)}</select></label><label className="text-sm font-medium">Due day (1–28)<input type="number" min="1" max="28" value={day} onChange={(e) => setDay(e.target.value)} className="input-notebook mt-1.5 h-11 w-full rounded-xl px-3"/></label><button className="self-end rounded-xl bg-secondary px-5 py-3 font-semibold text-secondary-foreground"><Plus className="mr-1 inline h-4 w-4"/> Add recurring expense</button></form>{error && <p className="mt-3 text-sm text-destructive" role="alert">{error}</p>}<div className="mt-5 space-y-2">{rules.length === 0 ? <p className="rounded-xl bg-muted/60 p-4 text-sm text-muted-foreground">No recurring expenses configured.</p> : rules.map((rule) => <div key={rule.id} className="flex flex-wrap items-center gap-3 rounded-xl border border-border p-3"><div className="min-w-0 flex-1"><p className="font-semibold">{rule.name}</p><p className="mt-1 text-xs text-muted-foreground">₹{formatAmount(rule.amount)} · {rule.category} · Day {rule.day} · {rule.payment}{rule.lastRunMonth ? ` · Last added ${rule.lastRunMonth}` : ''}</p></div><button type="button" onClick={() => onSave({ ...settings, recurringRules: rules.map((r) => r.id === rule.id ? { ...r, enabled: !r.enabled } : r) })} className="rounded-lg border border-border px-3 py-2 text-xs font-semibold">{rule.enabled ? 'Disable' : 'Enable'}</button><button type="button" onClick={() => onSave({ ...settings, recurringRules: rules.filter((r) => r.id !== rule.id) })} className="rounded-lg border border-destructive/30 px-3 py-2 text-xs font-semibold text-destructive">Delete</button></div>)}</div></section><section className="rounded-2xl border border-border bg-muted/50 p-4 text-sm text-muted-foreground"><p className="font-semibold text-foreground">Privacy and backups</p><p className="mt-1">Records stay in this browser's IndexedDB. Full backup and restore are available in Reports. Export backups regularly because clearing browser site data can erase local records.</p></section></div>;
 }
 
 function AddExpensePage({ onSubmit, isPending, inputRef }: { onSubmit: (input: { amount: number; category: ExpenseCategory; item?: string; payment: PaymentMethod; spentAt?: string }) => void; isPending: boolean; inputRef: RefObject<HTMLInputElement | null> }) {
@@ -348,11 +709,11 @@ function AddExpensePage({ onSubmit, isPending, inputRef }: { onSubmit: (input: {
 }
 
 function Sidebar({ location, navigate }: { location: string; navigate: (path: string) => void }) {
-  return <aside className="hidden w-[258px] shrink-0 flex-col bg-sidebar px-6 py-7 text-sidebar-foreground md:flex"><Brand /><div className="mt-14"><p className="mb-3 px-3 font-mono text-[10px] uppercase tracking-[.22em] text-sidebar-foreground/50">Your space</p><nav className="space-y-1" aria-label="Main navigation">{[['/', 'Overview', IndianRupee], ['/ledger', 'Ledger', Receipt], ['/reports', 'Reports', BarChart3], ['/add', 'Add expense', Plus]].map(([path, label, Icon]) => <button type="button" key={path as string} onClick={() => navigate(path as string)} className={`nav-lift flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm ${location === path ? 'bg-sidebar-accent font-semibold text-sidebar-accent-foreground' : 'text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground'}`}><Icon className={`h-4 w-4 ${path === '/add' ? 'text-secondary' : ''}`} />{label as string}</button>)}</nav></div><div className="mt-auto rounded-2xl border border-sidebar-border bg-sidebar-accent/60 p-4"><Sparkles className="mb-3 h-4 w-4 text-secondary" /><p className="font-serif text-lg leading-tight">Small notes.<br />Clearer days.</p><p className="mt-2 text-xs leading-relaxed text-sidebar-foreground/55">A little attention goes a long way.</p></div><div className="mt-5 flex items-center gap-3 border-t border-sidebar-border pt-5"><div className="grid h-8 w-8 place-items-center rounded-full bg-secondary text-xs font-bold text-secondary-foreground">K</div><div><p className="text-sm font-semibold">My Khata</p><p className="text-[11px] text-sidebar-foreground/50">Personal ledger</p></div></div></aside>;
+  return <aside className="hidden w-[258px] shrink-0 flex-col bg-sidebar px-6 py-7 text-sidebar-foreground md:flex"><Brand /><div className="mt-14"><p className="mb-3 px-3 font-mono text-[10px] uppercase tracking-[.22em] text-sidebar-foreground/50">Your space</p><nav className="space-y-1" aria-label="Main navigation">{[['/', 'Overview', IndianRupee], ['/ledger', 'Ledger', Receipt], ['/reports', 'Reports', BarChart3], ['/balance', 'Balance', ArrowLeftRight], ['/settings', 'Settings', LockKeyhole], ['/add', 'Add expense', Plus]].map(([path, label, Icon]) => <button type="button" key={path as string} onClick={() => navigate(path as string)} className={`nav-lift flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm ${location === path ? 'bg-sidebar-accent font-semibold text-sidebar-accent-foreground' : 'text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground'}`}><Icon className={`h-4 w-4 ${path === '/add' ? 'text-secondary' : ''}`} />{label as string}</button>)}</nav></div><div className="mt-auto rounded-2xl border border-sidebar-border bg-sidebar-accent/60 p-4"><Sparkles className="mb-3 h-4 w-4 text-secondary" /><p className="font-serif text-lg leading-tight">Small notes.<br />Clearer days.</p><p className="mt-2 text-xs leading-relaxed text-sidebar-foreground/55">A little attention goes a long way.</p></div><div className="mt-5 flex items-center gap-3 border-t border-sidebar-border pt-5"><div className="grid h-8 w-8 place-items-center rounded-full bg-secondary text-xs font-bold text-secondary-foreground">K</div><div><p className="text-sm font-semibold">My Khata</p><p className="text-[11px] text-sidebar-foreground/50">Personal ledger</p></div></div></aside>;
 }
 
 function MobileNav({ location, navigate }: { location: string; navigate: (path: string) => void }) {
-  return <nav className="fixed inset-x-3 bottom-3 z-20 grid grid-cols-4 rounded-2xl border border-border bg-card/95 p-1.5 shadow-2xl backdrop-blur md:hidden">{[['/', 'Home', IndianRupee], ['/ledger', 'Ledger', Receipt], ['/reports', 'Reports', BarChart3], ['/add', 'Add', Plus]].map(([path, label, Icon]) => <button type="button" key={path as string} onClick={() => navigate(path as string)} className={`flex flex-col items-center gap-1 rounded-xl py-2 text-[10px] font-semibold ${location === path ? 'bg-primary text-primary-foreground' : 'text-muted-foreground'}`}><Icon className="h-4 w-4" />{label as string}</button>)}</nav>;
+  return <nav className="fixed inset-x-2 bottom-[max(0.75rem,env(safe-area-inset-bottom))] z-20 grid grid-cols-6 rounded-2xl border border-border bg-card/95 p-1.5 shadow-2xl backdrop-blur md:hidden">{[['/', 'Home', IndianRupee], ['/ledger', 'Ledger', Receipt], ['/reports', 'Reports', BarChart3], ['/balance', 'Balance', ArrowLeftRight], ['/add', 'Add', Plus]].map(([path, label, Icon]) => <button type="button" key={path as string} onClick={() => navigate(path as string)} className={`flex flex-col items-center gap-1 rounded-xl py-2 text-[10px] font-semibold ${location === path ? 'bg-primary text-primary-foreground' : 'text-muted-foreground'}`}><Icon className="h-4 w-4" />{label as string}</button>)}</nav>;
 }
 
 function Brand({ compact = false }: { compact?: boolean }) {
@@ -387,11 +748,11 @@ function DateField({ label, value, onChange }: { label: string; value: string; o
   return <label><span className="mb-1.5 block text-[10px] font-bold uppercase tracking-[.12em] text-muted-foreground">{label}</span><input type="date" value={value} onChange={(event) => onChange(event.target.value)} className="input-notebook h-11 w-full rounded-xl px-3 text-sm" /></label>;
 }
 
-function ExpenseList({ expenses, isLoading, isError, onRetry, onDelete, compact = false }: { expenses: Expense[]; isLoading: boolean; isError: boolean; onRetry: () => void; onDelete: (expense: Expense) => void; compact?: boolean }) {
+function ExpenseList({ expenses, isLoading, isError, onRetry, onDelete, onEdit, onDuplicate, compact = false }: { expenses: Expense[]; isLoading: boolean; isError: boolean; onRetry: () => void; onDelete: (expense: Expense) => void; onEdit?: (expense: Expense) => void; onDuplicate?: (expense: Expense) => void; compact?: boolean }) {
   if (isLoading) return <div className="space-y-4 pt-5" aria-label="Loading expenses">{[1, 2, 3].map((item) => <div key={item} className="flex animate-pulse items-center gap-3 py-3"><div className="h-11 w-11 rounded-xl bg-muted" /><div className="flex-1"><div className="h-3 w-32 rounded bg-muted" /><div className="mt-2 h-2 w-20 rounded bg-muted" /></div></div>)}</div>;
   if (isError) return <div className="py-12 text-center"><p className="font-serif text-xl">The page got a little smudged.</p><p className="mt-2 text-sm text-muted-foreground">We couldn’t read these entries.</p><button type="button" onClick={onRetry} className="lux-button mt-4 rounded-full border border-border px-4 py-2 text-xs font-bold">Try again</button></div>;
   if (expenses.length === 0) return <div className="py-14 text-center"><div className="mx-auto grid h-14 w-14 place-items-center rounded-2xl bg-secondary/25 text-primary"><Receipt className="h-6 w-6" /></div><h3 className="mt-4 font-serif text-2xl">A fresh page.</h3><p className="mx-auto mt-2 max-w-xs text-sm leading-relaxed text-muted-foreground">Nothing matches these filters yet.</p></div>;
-  return <div className="pt-1">{expenses.map((expense, index) => <div key={expense.id} className="ledger-rule group flex items-center gap-3 py-4 last:bg-none animate-rise" style={{ animationDelay: `${index * 35}ms` }}><div className={`grid h-11 w-11 shrink-0 place-items-center rounded-xl ${categoryTone(expense.category)}`}><CategoryIcon category={expense.category} /></div><div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{expense.item || categoryLabel(expense.category)}</p><p className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">{formatDateTime(expense.spentAt)}<span className="h-1 w-1 rounded-full bg-muted-foreground/50" />{expense.payment}</p></div><p className="font-mono text-sm font-medium">₹{formatAmount(expense.amount)}</p>{!compact && <button type="button" aria-label={`Delete ${expense.item || 'expense'}`} onClick={() => onDelete(expense)} className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted-foreground opacity-0 transition-all hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100 focus:opacity-100"><Trash2 className="h-4 w-4" /></button>}</div>)}</div>;
+  return <div className="pt-1">{expenses.map((expense, index) => <div key={expense.id} className="ledger-rule group flex items-center gap-3 py-4 last:bg-none animate-rise" style={{ animationDelay: `${index * 35}ms` }}><div className={`grid h-11 w-11 shrink-0 place-items-center rounded-xl ${categoryTone(expense.category)}`}><CategoryIcon category={expense.category} /></div><div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{expense.item || categoryLabel(expense.category)}</p><p className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">{formatDateTime(expense.spentAt)}<span className="h-1 w-1 rounded-full bg-muted-foreground/50" />{expense.payment}</p></div><p className="font-mono text-sm font-medium">₹{formatAmount(expense.amount)}</p>{!compact && <div className="flex shrink-0 items-center gap-1"><button type="button" aria-label={`Edit ${expense.item || 'expense'}`} onClick={() => onEdit?.(expense)} title="Edit" className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"><Pencil className="h-4 w-4" /></button><button type="button" aria-label={`Duplicate ${expense.item || 'expense'}`} onClick={() => onDuplicate?.(expense)} title="Duplicate" className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"><Layers3 className="h-4 w-4" /></button><button type="button" aria-label={`Delete ${expense.item || 'expense'}`} onClick={() => onDelete(expense)} title="Delete" className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground hover:bg-destructive/10 hover:text-destructive"><Trash2 className="h-4 w-4" /></button></div>}</div>)}</div>;
 }
 
 function ReportCharts({ summary, expenses, isLoading, rangeLabel }: { summary?: Summary; expenses: Expense[]; isLoading: boolean; rangeLabel: string }) {
@@ -442,7 +803,7 @@ function Composer({ onSubmit, isPending, inputRef }: { onSubmit: (input: { amoun
   const [amount, setAmount] = useState('');
   const [item, setItem] = useState('');
   const [category, setCategory] = useState<ExpenseCategory>(Categories.Food);
-  const [payment, setPayment] = useState<PaymentMethod>(Payments.UPI);
+  const [payment, setPayment] = useState<PaymentMethod>(() => { try { const saved = localStorage.getItem('kharcha-khata-last-payment'); return saved && Object.values(Payments).includes(saved as PaymentMethod) ? saved as PaymentMethod : Payments.UPI; } catch { return Payments.UPI; } });
   const [spentAt, setSpentAt] = useState(() => { const now = new Date(); const offset = now.getTimezoneOffset(); return new Date(now.getTime() - offset * 60000).toISOString().slice(0, 16); });
   const [error, setError] = useState('');
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -454,7 +815,16 @@ function Composer({ onSubmit, isPending, inputRef }: { onSubmit: (input: { amoun
     setAmount('');
     setItem('');
   };
-  return <form onSubmit={submit} className="lux-card rounded-[1.8rem] border border-border bg-card p-5 sm:p-8"><div className="grid gap-5 md:grid-cols-[1fr_1.2fr]"><div><label htmlFor="expense-amount" className="mb-2 block text-xs font-bold uppercase tracking-[.1em] text-muted-foreground">Amount <span className="text-destructive">*</span></label><div className="relative"><span className="absolute left-4 top-1/2 -translate-y-1/2 font-serif text-xl text-muted-foreground">₹</span><input ref={inputRef} id="expense-amount" type="number" min="0.01" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} placeholder="0.00" className="input-notebook h-16 w-full rounded-xl pl-10 pr-4 font-mono text-2xl text-foreground placeholder:text-muted-foreground/35" /></div>{error && <p className="mt-2 text-xs font-semibold text-destructive">{error}</p>}</div><div><label htmlFor="expense-item" className="mb-2 block text-xs font-bold uppercase tracking-[.1em] text-muted-foreground">What was it for? <span className="font-normal normal-case tracking-normal text-muted-foreground/60">optional</span></label><input id="expense-item" value={item} onChange={(event) => setItem(event.target.value)} placeholder="A quick note, like chai with Riya" className="input-notebook h-16 w-full rounded-xl px-4 text-sm text-foreground placeholder:text-muted-foreground/55" /></div></div><div className="mt-6"><p className="mb-3 text-xs font-bold uppercase tracking-[.1em] text-muted-foreground">Category <span className="text-destructive">*</span></p><div className="grid grid-cols-4 gap-2 sm:grid-cols-7">{categoryOptions.map((option) => <button type="button" key={option.value} onClick={() => setCategory(option.value)} className={`lux-button flex flex-col items-center gap-2 rounded-xl border px-2 py-3 text-[11px] font-semibold transition-colors ${category === option.value ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-background text-muted-foreground hover:border-primary/40 hover:text-foreground'}`}><option.Icon className="h-4 w-4" />{option.label}</button>)}</div></div><div className="mt-6 grid gap-5 sm:grid-cols-[1fr_1fr_1.25fr]"><div><label htmlFor="expense-payment" className="mb-2 block text-xs font-bold uppercase tracking-[.1em] text-muted-foreground">Paid with <span className="text-destructive">*</span></label><div className="relative"><select id="expense-payment" value={payment} onChange={(event) => setPayment(event.target.value as PaymentMethod)} className="input-notebook h-12 w-full appearance-none rounded-xl px-3 pr-9 text-sm"><option value={Payments.UPI}>UPI</option><option value={Payments.Cash}>Cash</option><option value={Payments.Card}>Card</option><option value={Payments.Other}>Other</option></select><ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 text-muted-foreground" /></div></div><div><label htmlFor="expense-date" className="mb-2 block text-xs font-bold uppercase tracking-[.1em] text-muted-foreground">When</label><input id="expense-date" type="datetime-local" value={spentAt} onChange={(event) => setSpentAt(event.target.value)} className="input-notebook h-12 w-full rounded-xl px-3 text-sm" /></div><button type="submit" disabled={isPending} className="lux-button mt-auto flex h-12 items-center justify-center gap-2 rounded-xl bg-secondary px-5 text-sm font-bold text-secondary-foreground disabled:cursor-wait disabled:opacity-60">{isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />} {isPending ? 'Saving…' : 'Save expense'}</button></div></form>;
+  return <form onSubmit={submit} className="lux-card rounded-[1.8rem] border border-border bg-card p-5 sm:p-8"><div className="grid gap-5 md:grid-cols-[1fr_1.2fr]"><div><label htmlFor="expense-amount" className="mb-2 block text-xs font-bold uppercase tracking-[.1em] text-muted-foreground">Amount <span className="text-destructive">*</span></label><div className="relative"><span className="absolute left-4 top-1/2 -translate-y-1/2 font-serif text-xl text-muted-foreground">₹</span><input ref={inputRef} id="expense-amount" type="number" min="0.01" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} placeholder="0.00" className="input-notebook h-16 w-full rounded-xl pl-10 pr-4 font-mono text-2xl text-foreground placeholder:text-muted-foreground/35" /></div>{error && <p className="mt-2 text-xs font-semibold text-destructive">{error}</p>}</div><div><label htmlFor="expense-item" className="mb-2 block text-xs font-bold uppercase tracking-[.1em] text-muted-foreground">What was it for? <span className="font-normal normal-case tracking-normal text-muted-foreground/60">optional</span></label><input id="expense-item" value={item} onChange={(event) => setItem(event.target.value)} placeholder="A quick note, like chai with Riya" className="input-notebook h-16 w-full rounded-xl px-4 text-sm text-foreground placeholder:text-muted-foreground/55" /></div></div><div className="mt-6"><p className="mb-3 text-xs font-bold uppercase tracking-[.1em] text-muted-foreground">Category <span className="text-destructive">*</span></p><div className="grid grid-cols-4 gap-2 sm:grid-cols-7">{categoryOptions.map((option) => <button type="button" key={option.value} onClick={() => setCategory(option.value)} className={`lux-button flex flex-col items-center gap-2 rounded-xl border px-2 py-3 text-[11px] font-semibold transition-colors ${category === option.value ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-background text-muted-foreground hover:border-primary/40 hover:text-foreground'}`}><option.Icon className="h-4 w-4" />{option.label}</button>)}</div></div><div className="mt-6 grid gap-5 sm:grid-cols-[1fr_1fr_1.25fr]"><div><label htmlFor="expense-payment" className="mb-2 block text-xs font-bold uppercase tracking-[.1em] text-muted-foreground">Paid with <span className="text-destructive">*</span></label><div className="relative"><select id="expense-payment" value={payment} onChange={(event) => { const next = event.target.value as PaymentMethod; setPayment(next); try { localStorage.setItem('kharcha-khata-last-payment', next); } catch { /* storage can be disabled */ } }} className="input-notebook h-12 w-full appearance-none rounded-xl px-3 pr-9 text-sm"><option value={Payments.Cash}>Cash</option><option value={Payments.UPI}>UPI</option><option value={Payments.Card}>Debit card</option><option value={Payments.Other}>Other</option></select><ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 text-muted-foreground" /></div></div><div><label htmlFor="expense-date" className="mb-2 block text-xs font-bold uppercase tracking-[.1em] text-muted-foreground">When</label><input id="expense-date" type="datetime-local" value={spentAt} onChange={(event) => setSpentAt(event.target.value)} className="input-notebook h-12 w-full rounded-xl px-3 text-sm" /></div><button type="submit" disabled={isPending} className="lux-button mt-auto flex h-12 items-center justify-center gap-2 rounded-xl bg-secondary px-5 text-sm font-bold text-secondary-foreground disabled:cursor-wait disabled:opacity-60">{isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />} {isPending ? 'Saving…' : 'Save expense'}</button></div></form>;
+}
+
+function EditExpenseDialog({ expense, isPending, onCancel, onSave }: { expense: Expense; isPending: boolean; onCancel: () => void; onSave: (input: { amount: number; category: ExpenseCategory; item?: string; payment: PaymentMethod; spentAt?: string }) => void }) {
+  const [amount, setAmount] = useState(String(expense.amount));
+  const [category, setCategory] = useState<ExpenseCategory>(expense.category);
+  const [item, setItem] = useState(expense.item ?? '');
+  const [payment, setPayment] = useState<PaymentMethod>(expense.payment);
+  const [spentAt, setSpentAt] = useState(() => { const d = new Date(expense.spentAt); const offset = d.getTimezoneOffset(); return new Date(d.getTime() - offset * 60000).toISOString().slice(0,16); });
+  return <div className="fixed inset-0 z-40 grid place-items-center bg-primary/35 p-4 backdrop-blur-sm"><form role="dialog" aria-modal="true" aria-labelledby="edit-expense-title" onSubmit={(event) => { event.preventDefault(); const value = Number(amount); if (!Number.isFinite(value) || value <= 0) return; onSave({ amount: value, category, item, payment, spentAt: new Date(spentAt).toISOString() }); }} className="max-h-[90dvh] w-full max-w-lg space-y-4 overflow-y-auto rounded-2xl border border-border bg-card p-5 shadow-2xl sm:p-7"><div className="flex items-center justify-between"><h2 id="edit-expense-title" className="font-serif text-2xl">Edit expense</h2><button type="button" onClick={onCancel} aria-label="Close edit dialog"><X className="h-5 w-5" /></button></div><label className="block text-sm font-medium">Amount (₹)<input type="number" min="0.01" step="0.01" required value={amount} onChange={(e) => setAmount(e.target.value)} className="input-notebook mt-1.5 h-12 w-full rounded-xl px-3" /></label><label className="block text-sm font-medium">Description<input maxLength={500} value={item} onChange={(e) => setItem(e.target.value)} className="input-notebook mt-1.5 h-12 w-full rounded-xl px-3" /></label><label className="block text-sm font-medium">Category<select value={category} onChange={(e) => setCategory(e.target.value as ExpenseCategory)} className="input-notebook mt-1.5 h-12 w-full rounded-xl px-3">{categoryOptions.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}</select></label><label className="block text-sm font-medium">Payment method<select value={payment} onChange={(e) => setPayment(e.target.value as PaymentMethod)} className="input-notebook mt-1.5 h-12 w-full rounded-xl px-3">{Object.values(Payments).map((p) => <option key={p} value={p}>{p}</option>)}</select></label><label className="block text-sm font-medium">Date and time<input type="datetime-local" required value={spentAt} onChange={(e) => setSpentAt(e.target.value)} className="input-notebook mt-1.5 h-12 w-full rounded-xl px-3" /></label><div className="flex gap-2 pt-2"><button type="button" onClick={onCancel} className="flex-1 rounded-xl border border-border px-4 py-3 font-semibold">Cancel</button><button disabled={isPending} className="flex-1 rounded-xl bg-primary px-4 py-3 font-semibold text-primary-foreground disabled:opacity-50">{isPending ? 'Saving…' : 'Save changes'}</button></div></form></div>;
 }
 
 function DeleteDialog({ expense, isPending, onCancel, onConfirm }: { expense: Expense; isPending: boolean; onCancel: () => void; onConfirm: () => void }) {
@@ -520,6 +890,12 @@ function buildPdfBlob(title: string, lines: string[]) {
   return new Blob([pdf], { type: 'application/pdf' });
 }
 function pdfEscape(value: string) { return value.replace(/[\\()]/g, '\\$&').replace(/[^\x20-\x7E]/g, '?'); }
+function exportExpensesCsv(expenses: Expense[]) {
+  const quote = (value: unknown) => `"${String(value ?? '').replace(/"/g, '""')}"`;
+  const rows = [['Date', 'Category', 'Note', 'Payment method', 'Amount'], ...expenses.map((expense) => [new Date(expense.spentAt).toLocaleString('en-IN'), categoryLabel(expense.category), expense.item ?? '', expense.payment, expense.amount])];
+  const csv = '\uFEFF' + rows.map((row) => row.map(quote).join(',')).join('\r\n');
+  triggerDownload(new Blob([csv], { type: 'text/csv;charset=utf-8' }), `kharcha-khata-expenses-${localDateKey(new Date())}.csv`);
+}
 function triggerDownload(blob: Blob, filename: string) { const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = filename; anchor.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000); }
 
 function Router() { return <RoutedErrorBoundary><AppShell /></RoutedErrorBoundary>; }

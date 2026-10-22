@@ -50,7 +50,43 @@ export default defineConfig({
     alias: { '@': path.resolve(rootDir, 'src') },
     dedupe: ['react', 'react-dom'],
   },
-  build: { outDir: 'dist', emptyOutDir: true },
+  build: {
+    outDir: 'dist',
+    emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return;
+
+          if (id.includes('lucide-react')) return 'icons';
+
+          if (
+            id.includes('@tanstack/react-query') ||
+            id.includes('@tanstack/query-core')
+          ) {
+            return 'query-vendor';
+          }
+
+          if (
+            id.includes('react-dom') ||
+            id.includes('react/') ||
+            id.includes('/react/') ||
+            id.includes('scheduler')
+          ) {
+            return 'react-vendor';
+          }
+
+          if (
+            id.includes('recharts') ||
+            id.includes('d3-') ||
+            id.includes('victory-vendor')
+          ) {
+            return 'charts';
+          }
+        },
+      },
+    },
+  },
   preview: { host: '0.0.0.0' },
   server: { host: '0.0.0.0' },
 });
