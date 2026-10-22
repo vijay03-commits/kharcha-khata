@@ -1,3 +1,40 @@
+# 💰 Kharcha Khata
+
+A free and simple app to track your daily expenses.
+
+🔗 **Live App:** https://kharcha-khata.parmarvijay26032004.workers.dev
+
+## 📱 How to Install
+
+1. Open the app link in Google Chrome on your phone.
+2. Tap the three dots (⋮) in the top-right corner.
+3. Select **Install app** or **Add to Home screen**.
+4. Open the app and start tracking your expenses!
+
+## ✨ Features
+
+- 💸 Track daily expenses
+- 📱 Easy to use on your phone
+- 🆓 Completely free
+- ⚡ Simple and user-friendly
+- 📶 Offline support, depending on app configuration
+
+## 🚀 Getting Started
+
+No Play Store download is required. Just open the link and add the app to your home screen.
+
+## 🔒 Privacy
+
+Keep your expense records and backups safe. Data storage and offline availability depend on the app's implementation.
+
+## ⭐ Support
+
+If you find Kharcha Khata useful, please give this repository a **star ⭐** on GitHub!
+
+---
+
+**Made with ❤️ for simple expense tracking.**
+
 # Kharcha Khata Offline
 
 An offline-first personal expense tracker based on the existing Kharcha Khata interface. Expense records are stored in the browser's IndexedDB database on the device that uses the app. There is no account login, backend API, cloud database, or automatic synchronization in this version.
